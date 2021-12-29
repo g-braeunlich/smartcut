@@ -4,6 +4,14 @@ import smartcut
 
 
 class SmartCutTest(unittest.TestCase):
+    def test_to_seconds(self):
+        with self.subTest(fps=25):
+            t = smartcut.to_seconds(10, 25.0)
+            self.assertEqual(t, "0.400")
+        with self.subTest(fps=50):
+            t = smartcut.to_seconds(10, 50.0)
+            self.assertEqual(t, "0.200")
+
     def test_to_timestamp(self):
         t = smartcut.to_timestamp(6611, 25.0)
         self.assertEqual(t, "00:04:24.440")

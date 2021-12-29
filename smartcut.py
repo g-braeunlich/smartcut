@@ -4,6 +4,7 @@ Needed tools:
 - mediainfo
 - x264_encoder with ffmpegsource support
 - ffmpegsource
+- ffmpeg
 - mkvtoolnix (mkvmerge)
 """
 
@@ -27,6 +28,7 @@ def smart_cut_file_by_cutlist(
     f_out,
     cutlist_frm: CutList,
     workingdir: Optional[str] = None,
+    segmented: bool = False,
     x264_profile: str = "HQ",
 ):
     """Cut a video file, reencoding GOP's containing cuts."""
@@ -42,8 +44,9 @@ def smart_cut_file_by_cutlist(
         video_parts = process_segments(
             segments, f_in, f_info, x264_profiles[x264_profile], _workingdir
         )
-        merge_parts(video_parts, audio_file, f_out)
-        cleanup(video_parts + [audio_file])
+        if not segmented:
+            merge_parts(video_parts, audio_file, f_out)
+            cleanup(video_parts + [audio_file])
 
 
 def smart_cut_file_by_cutlist_hd(
@@ -54,6 +57,85 @@ def smart_cut_file_by_cutlist_hd(
     segmented: bool = False,
 ):
     smart_cut_file_by_cutlist(f_in, f_out, cutlist_frm, workingdir, segmented)
+
+
+def cut_file_by_cutlist_reencode(
+    f_in,
+    f_out,
+    cutlist_frm: CutList,
+    workingdir: Optional[str] = None,
+    segmented: bool = False,
+):
+    """Cut a video file, reencoding everything with ffmpeg."""
+
+    fps = get_fps(f_in)
+    if segmented and workingdir:
+        f_out = os.path.join(workingdir, os.path.basename(f_out))
+    if segmented:
+        length = 20
+        cutlist_frm = sum(
+            (
+                [(start, start + length), (max(0, stop - length), stop)]
+                for start, stop in cutlist_frm
+            ),
+            [],
+        )
+    segments = tuple(f_out + f".{n}.mkv" for n in range(len(cutlist_frm)))
+    cmd = ("ffmpeg", "-y", "-i", f_in) + sum(
+        (
+            (
+                "-map",
+                "0",
+                "-c:s",
+                "copy",
+                "-ss",
+                to_seconds(start, fps),
+                "-to",
+                to_seconds(end, fps),
+                segment,
+            )
+            for segment, (start, end) in zip(segments, cutlist_frm)
+        ),
+        (),
+    )
+    cmd_exec(cmd)
+    if segmented:
+        return
+    cmd = (
+        ("mkvmerge", "-o", f_out)
+        + segments[:1]
+        + tuple("+" + segment for segment in segments[1:])
+    )
+    print(" ".join(cmd))
+    cmd_exec(cmd)
+    for segment in segments:
+        os.unlink(segment)
+
+
+def cut_file_by_cutlist(
+    f_in,
+    f_out,
+    cutlist_frm: CutList,
+    workingdir: Optional[str] = None,
+    segmented: bool = False,
+):
+    """Only cut at I frames."""
+    fps = get_fps(f_in)
+    mkvmerge_segments = to_mkvmerge_time_segments(
+        cutlist_frm, fps=fps, separator="," if segmented else ",+"
+    )
+    if segmented and workingdir:
+        f_out = os.path.join(workingdir, os.path.basename(f_out))
+    cmd = (
+        "mkvmerge",
+        "--split",
+        "parts:" + mkvmerge_segments,
+        "-o",
+        f_out,
+        f_in,
+    )
+    print(" ".join(cmd))
+    cmd_exec(cmd)
 
 
 def workingdir_context_manager(workingdir: Optional[str]):
@@ -252,6 +334,32 @@ class Tgt:
         self.tp = tp
 
 
+def get_fps(filename: str) -> float:
+    try:
+        output = cmd_exec(
+            (
+                "ffprobe",
+                filename,
+                "-v",
+                "0",
+                "-select_streams",
+                "v",
+                "-print_format",
+                "flat",
+                "-show_entries",
+                "stream=r_frame_rate",
+            )
+        ).stdout
+        fps_str = output.strip().split(b"=")[1].strip(b'"')
+    except (FileNotFoundError, RuntimeError):
+        sys.stderr.write("⚠ Could not determine fps, defaulting to 25\n")
+        return 25.0
+    if b"/" in fps_str:
+        a, b = fps_str.split(b"/")
+        return float(a) / float(b)
+    return float(fps_str)
+
+
 def get_encoder_infos(filename):
     try:
         output = cmd_exec(("mediainfo", filename)).stdout.decode()
@@ -375,17 +483,18 @@ def load_cutlist(stream):
 
 def load_cutlist_avidemux(stream):
     """Avidemux seems to start at t>0 (depending on reference frames it has to load). Example: 5.2 sec <-> 13 frames @ 25 fps"""
-    fps = 25
+    to_frm = lambda s: int(int(s) * fps // 1000000)
     mapping = {
         r"adm.addSegment\(0, ([0-9]*), ([0-9]*)\);?": (
-            Tgt("start", lambda s: int(int(s) * fps // 1000000)),
-            Tgt("duration", lambda s: int(int(s) * fps // 1000000)),
+            Tgt("start", int),
+            Tgt("duration", int),
         ),
         r'(?:if not )?adm.loadVideo\("([^"]*)"\);?:?': Tgt("in_file"),
     }
     out = parse(stream, mapping)
+    fps = get_fps(out["in_file"])
     out["cutlist_frames"] = tuple(
-        (max(0, start), (start + duration))
+        (max(0, to_frm(start)), to_frm(start + duration))
         for start, duration in zip(
             listify(out.pop("start", [])), listify(out.pop("duration", []))
         )
@@ -415,12 +524,22 @@ def to_mkvmerge_frame_segments(cutlist_frm: CutList, separator: str = ",+") -> s
     )
 
 
-def to_timestamp(frm: int, fps: float = 25) -> str:
-    sec = int(frm // fps)
-    ms = int(frm * 1000 / fps) - 1000 * sec
+def to_timestamp(frm: int, fps: float = 25.0) -> str:
+    sec, ms = to_sec_ms(frm, fps)
     mins, sec = divmod(sec, 60)
     hours, mins = divmod(mins, 60)
     return f"{hours:02}:{mins:02}:{sec:02}.{ms:03}"
+
+
+def to_seconds(frm: int, fps: float = 25.0) -> str:
+    sec, ms = to_sec_ms(frm, fps)
+    return f"{sec}.{ms:03}"
+
+
+def to_sec_ms(frm: int, fps: float) -> tuple[int, int]:
+    sec = int(frm // fps)
+    ms = int(frm * 1000 / fps) - 1000 * sec
+    return (sec, ms)
 
 
 cutlist_type_catalogue = {
@@ -499,12 +618,20 @@ if __name__ == "__main__":
         "smart": smart_cut_file_by_cutlist,
         "smart:HQ": smart_cut_file_by_cutlist,
         "smart:HD": smart_cut_file_by_cutlist_hd,
+        "lossless": cut_file_by_cutlist,
+        "reencode": cut_file_by_cutlist_reencode,
     }
     parser.add_argument(
         "--mode",
         default=smart_cut_file_by_cutlist,
         type=modes.__getitem__,
         help=f"Cut mode ({' / '.join(modes)})",
+    )
+    parser.add_argument(
+        "--segmented",
+        default=False,
+        action="store_true",
+        help="Output segments instead of one movie",
     )
 
     cmd_args = parser.parse_args()
@@ -517,6 +644,7 @@ if __name__ == "__main__":
             offset=cmd_args.offset,
             workingdir=cmd_args.workingdir,
             cut_method=cmd_args.mode,
+            segmented=cmd_args.segmented,
         )
     except subprocess.CalledProcessError as _e:
         sys.stderr.write(_e.stderr + "\n")
