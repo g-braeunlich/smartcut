@@ -10,52 +10,60 @@ Needed tools:
 import bisect
 import subprocess
 import os
+import sys
 import re
 import tempfile
 import contextlib
+from itertools import count
+
+from collections.abc import Sequence
+from typing import Optional
+
+CutList = Sequence[tuple[int, int]]
 
 
-def cut_file_by_cutlist(f_in, f_out,
-                        cutlist_frm,
-                        cutlist_t=None,
-                        workingdir=None,
-                        x264_profile="HQ"):
-    """ Main routine for cutting """
+def smart_cut_file_by_cutlist(
+    f_in,
+    f_out,
+    cutlist_frm: CutList,
+    workingdir: Optional[str] = None,
+    x264_profile: str = "HQ",
+):
+    """Cut a video file, reencoding GOP's containing cuts."""
+    f_info = get_encoder_infos(f_in)
+    fps = f_info.get("framerate", 25.0)
     with workingdir_context_manager(workingdir)() as _workingdir:
-        f_info = get_encoder_infos(f_in)
-        if cutlist_t is None:
-            cutlist_t = cutlist_time_from_frames(
-                cutlist_frm, f_info.get("framerate", 25.0))
-
         audio_file = os.path.join(_workingdir, "audio_copy.mkv")
-        cut_audio(
-            f_in, audio_file, cutlist_t)
+        cut_audio(f_in, audio_file, cutlist_frm, fps)
         keyframes = load_keyframes_from_file(f_in)
-        segments = []
-        for start, end in cutlist_frm:
-            segments += segment(start, end, keyframes)
+        segments: list[Segment] = sum(
+            (make_segments(start, end, keyframes) for start, end in cutlist_frm), []
+        )
         video_parts = process_segments(
-            segments, f_in, f_info, x264_profiles[x264_profile],
-            _workingdir)
+            segments, f_in, f_info, x264_profiles[x264_profile], _workingdir
+        )
         merge_parts(video_parts, audio_file, f_out)
         cleanup(video_parts + [audio_file])
 
 
-def workingdir_context_manager(workingdir):
-    """ TemporaryDirectory if workingdir is None else trivial contextmanager """
+def smart_cut_file_by_cutlist_hd(
+    f_in,
+    f_out,
+    cutlist_frm: CutList,
+    workingdir: Optional[str] = None,
+    segmented: bool = False,
+):
+    smart_cut_file_by_cutlist(f_in, f_out, cutlist_frm, workingdir, segmented)
+
+
+def workingdir_context_manager(workingdir: Optional[str]):
+    """TemporaryDirectory if workingdir is None else trivial contextmanager"""
     if workingdir is None:
         return tempfile.TemporaryDirectory
-    return contextlib.contextmanager(lambda: (yield workingdir))
-
-
-def cleanup(files):
-    for f in files:
-        if os.path.isfile(f):
-            os.remove(f)
+    return lambda: contextlib.nullcontext(workingdir)
 
 
 class Segment:
-
     def __init__(self, start, stop):
         self.start = start
         self.stop = stop
@@ -69,29 +77,23 @@ class Recode(Segment):
     pass
 
 
-def cmd_exec(cmd, ok_return_codes=(0,)):
+def cmd_exec(cmd, ok_return_codes=(0,)) -> subprocess.CompletedProcess:
     cmd_str = " ".join(cmd)
     print(cmd_str)
     try:
-        result = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  universal_newlines=True)
-        result.wait()
-    except FileNotFoundError:
-        raise FileNotFoundError("Could not call {}".format(cmd_str))
-    if result.returncode not in ok_return_codes:
-        raise RuntimeError("stdout: \n".join(result.stdout) +
-                           "\nstderr:" + "\n".join(result.stderr))
-    return result.stdout
+        process = subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        if e.returncode not in ok_return_codes:
+            raise e
+    return process
 
 
 def load_keyframes_from_file(filename):
-    """ returns keyframe list - in frame numbers"""
+    """returns keyframe list - in frame numbers"""
 
     if not os.path.isfile(filename + ".ffindex_track00.kf.txt"):
         cmd_exec(("ffmsindex", "-p", "-f", "-k", filename))
-        if os.path.isfile(filename + ".ffindex"):
-            os.remove(filename + ".ffindex")
+        cleanup((filename + ".ffindex",))
 
     filename_keyframes = None
     for i in range(3):
@@ -100,51 +102,48 @@ def load_keyframes_from_file(filename):
             filename_keyframes = f
 
     try:
-        with open(filename_keyframes, 'r') as index:
+        with open(filename_keyframes, "r", encoding="utf-8") as index:
             index.readline()
             index.readline()
             try:
                 keyframes = tuple(map(int, index.read().splitlines()))
             except ValueError:
-                raise ValueError("Could not determinew Keyframes.")
-    except IOError:
+                raise ValueError("Could not determine Keyframes.") from None
+    except IOError as e:
         raise IOError(
-            "Could not open keyframe file {}.".format(filename_keyframes))
+            "Could not open keyframe file {}.".format(filename_keyframes)
+        ) from e
 
     return keyframes
 
 
-def segment(start, end, keyframes):
+def make_segments(start, end, keyframes) -> list[Segment]:
     if start in keyframes:
         if end in keyframes or end > keyframes[-1]:
             if end <= start:
                 return []
             # copy from keyframe to keyframe
             return [Copy(start, end)]
-        else:
-            # copy to keyframe before end
-            lt_kf_before_end = get_keyframe_in_front_of_frame(
-                keyframes, end)
-            if lt_kf_before_end is None:
-                raise ValueError("No keyframe in front of {}!".format(end))
-            if lt_kf_before_end <= start:
-                return [Recode(start, end)]
-            return [Copy(start, lt_kf_before_end),
-                    Recode(lt_kf_before_end, end)]
-    else:
-        nt_kf_from_start = get_keyframe_after_frame(keyframes, start)
-        if nt_kf_from_start is None:
-            raise ValueError(
-                "No keyframe after {} (last keyframe: {})!".format(
-                    start, keyframes[-1]))
-        segments = [Recode(start, nt_kf_from_start)]
-        if end <= nt_kf_from_start:
-            return segments
-        return segments + segment(nt_kf_from_start, end, keyframes)
+        # copy to keyframe before end
+        lt_kf_before_end = get_keyframe_in_front_of_frame(keyframes, end)
+        if lt_kf_before_end is None:
+            raise ValueError("No keyframe in front of {}!".format(end))
+        if lt_kf_before_end <= start:
+            return [Recode(start, end)]
+        return [Copy(start, lt_kf_before_end), Recode(lt_kf_before_end, end)]
+    nt_kf_from_start = get_keyframe_after_frame(keyframes, start)
+    if nt_kf_from_start is None:
+        raise ValueError(
+            "No keyframe after {} (last keyframe: {})!".format(start, keyframes[-1])
+        )
+    segments: list[Segment] = [Recode(start, nt_kf_from_start)]
+    if end <= nt_kf_from_start:
+        return segments
+    return segments + make_segments(nt_kf_from_start, end, keyframes)
 
 
 def get_keyframe_in_front_of_frame(keyframes, frame):
-    """ Find keyframe less-than to frame. """
+    """Find keyframe less-than to frame."""
     i = bisect.bisect_left(keyframes, frame)
     if i:
         return keyframes[i - 1]
@@ -152,94 +151,124 @@ def get_keyframe_in_front_of_frame(keyframes, frame):
 
 
 def get_keyframe_after_frame(keyframes, frame):
-    """ Find keyframe greater-than to frame. """
+    """Find keyframe greater-than to frame."""
     i = bisect.bisect_right(keyframes, frame)
     if i != len(keyframes):
         return keyframes[i]
     return None
 
 
-def cut_audio(f_in, f_out, cutlist_t):
-    audio_timecodes = ",+".join((get_timecode(start) + "-" + get_timecode(
-        stop) for start, stop in cutlist_t))
-    audio_timecodes = audio_timecodes.lstrip(",+")
-    cmd_exec(("mkvmerge", "-D", "--split",
-              "parts:" + audio_timecodes,
-              "-o", f_out, f_in))
-
-
-def get_timecode(time):
-    """
-    Converts the seconds into a timecode-format that mkvmerge
-    understands
-    """
-    minute, second = divmod(int(time), 60)		# discards milliseconds
-    hour, minute = divmod(minute, 60)
-    second = time - minute * 60 - hour * 3600  # for the milliseconds
-    return "%02i:%02i:%f" % (hour, minute, second)
+def cut_audio(f_in, f_out, cutlist_frm: CutList, fps: float):
+    mkvmerge_segments = to_mkvmerge_time_segments(cutlist_frm, fps)
+    cmd_exec(
+        ("mkvmerge", "-D", "--split", "parts:" + mkvmerge_segments, "-o", f_out, f_in)
+    )
 
 
 def encode(f_in, f_out, slc, encoder_info, x264_profile, workingdir):
     cmd_exec(
-        ("x264",) + get_x264_opts(encoder_info, x264_profile)
-        + ("--demuxer", "ffms",
-           "--index", os.path.join(workingdir, "x264.index"),
-           "--seek", str(slc.start),
-           "--frames", str(slc.stop - slc.start),
-           "--output", f_out, f_in)
+        ("x264",)
+        + get_x264_opts(encoder_info, x264_profile)
+        + (
+            "--demuxer",
+            "ffms",
+            "--index",
+            os.path.join(workingdir, "x264.index"),
+            "--seek",
+            str(slc.start),
+            "--frames",
+            str(slc.stop - slc.start),
+            "--output",
+            f_out,
+            f_in,
+        )
     )
 
 
 x264_profiles = {
-    "HD": ("--tune", "film",
-           "--direct", "auto",
-           "--force-cfr",
-           "--rc-lookahead", "60",
-           "--b-adapt", "2",
-           "--weightp", "0"),
-    "HQ": ("--tune", "film",
-           "--direct", "auto",
-           "--force-cfr",
-           "--rc-lookahead", "60",
-           "--b-adapt", "2",
-           "--aq-mode", "2",
-           "--weightp", "0")
+    "HD": (
+        "--tune",
+        "film",
+        "--direct",
+        "auto",
+        "--force-cfr",
+        "--rc-lookahead",
+        "60",
+        "--b-adapt",
+        "2",
+        "--weightp",
+        "0",
+    ),
+    "HQ": (
+        "--tune",
+        "film",
+        "--direct",
+        "auto",
+        "--force-cfr",
+        "--rc-lookahead",
+        "60",
+        "--b-adapt",
+        "2",
+        "--aq-mode",
+        "2",
+        "--weightp",
+        "0",
+    ),
 }
 
 
 def get_x264_opts(encoder_infos, profile):
     cp = encoder_infos["color_primaries"].split()[0].replace("BT.", "bt")
     if cp in {"bt709", "bt470m", "bt470bg", "bt2020"}:
-        cp_opts = ("--videoformat", "pal", "--colorprim", cp,
-                   "--transfer", cp, "--colormatrix", cp)
+        cp_opts = (
+            "--videoformat",
+            "pal",
+            "--colorprim",
+            cp,
+            "--transfer",
+            cp,
+            "--colormatrix",
+            cp,
+        )
     else:
         cp_opts = ()
-    return profile + cp_opts + (
-        "--profile", encoder_infos[
-            "format_profile_profile"].lower(),
-        "--level", str(encoder_infos["format_profile_level"]),
-        "--fps", str(encoder_infos["framerate"]))
+    return (
+        profile
+        + cp_opts
+        + (
+            "--profile",
+            encoder_infos["format_profile_profile"].lower(),
+            "--level",
+            str(encoder_infos["format_profile_level"]),
+            "--fps",
+            str(encoder_infos["framerate"]),
+        )
+    )
 
 
 class Tgt:
-
     def __init__(self, name, tp=(lambda x: x)):
         self.name = name
         self.tp = tp
 
 
 def get_encoder_infos(filename):
-    output = cmd_exec(("mediainfo", filename))
+    try:
+        output = cmd_exec(("mediainfo", filename)).stdout.decode()
+    except FileNotFoundError:
+        return {}
     return parse(
         output,
         {
             "Writing library *: *x264 core ([0-9]*)": Tgt("x264_core"),
             "Color primaries *: (.*[^ ]) *$": Tgt("color_primaries"),
-            "Format profile *: ([^@]*)@L([0-9]*) *$":
-            (Tgt("format_profile_profile"),
-             Tgt("format_profile_level", float)),
-            "Frame rate *: ([0-9.]*) FPS$": Tgt("framerate", float)
-        })
+            "Format profile *: ([^@]*)@L([0-9]*) *$": (
+                Tgt("format_profile_profile"),
+                Tgt("format_profile_level", float),
+            ),
+            "Frame rate *: ([0-9.]*) FPS$": Tgt("framerate", float),
+        },
+    )
 
 
 def parse(s, mapping):
@@ -265,49 +294,64 @@ def parse(s, mapping):
 
 
 def re_mapping(mapping):
-    return {re.compile(pattern): tuplify(key)
-            for pattern, key in mapping.items()}
+    return {re.compile(pattern): tuplify(key) for pattern, key in mapping.items()}
 
 
-def process_segments(segments, f_in, f_info, x264_profile, outdir):
+def process_segments(segments: Sequence[Segment], f_in, f_info, x264_profile, outdir):
     video_files = []
-    copy_file_indices = []
     copy_segments = []
-    i_copy = 1
-    i_encode = 1
+    copy_cnt = count(start=1)
+    encode_cnt = count(start=1)
     copy_tpl = os.path.join(outdir, "segment_copy{}.mkv")
+    n_copy = sum(1 for seg in segments if isinstance(seg, Copy))
     for seg in segments:
         if isinstance(seg, Copy):
-            copy_file_indices.append(len(video_files))
-            video_files.append(copy_tpl.format("-{:03d}".format(i_copy)))
+            # If there is only one copy segment, mkvmerge will not add a number suffix:
+            video_files.append(
+                copy_tpl.format(f"-{next(copy_cnt):03d}" if n_copy > 1 else "")
+            )
             copy_segments.append(seg)
-            i_copy += 1
         elif isinstance(seg, Recode):
-            f_out = os.path.join(outdir, "segment-{:03d}.mkv".format(i_encode))
+            f_out = os.path.join(outdir, f"segment-{next(encode_cnt):03d}.mkv")
             video_files.append(f_out)
             encode(f_in, f_out, seg, f_info, x264_profile, outdir)
-            i_encode += 1
-    # If there is only one copy segment, mkvmerge will not add a number suffix
-    if len(copy_segments) == 1:
-        video_files[copy_file_indices[0]] = copy_tpl.format("")
-    split_video(f_in, copy_tpl.format(""), copy_segments)
+    split_video(
+        f_in, copy_tpl.format(""), [(seg.start, seg.stop) for seg in copy_segments]
+    )
     return video_files
 
 
-def split_video(f_in, f_out, copy_segments):
-    copy_segments = ((str(seg.start + 1) + "-" + str(seg.stop + 1))
-                     for seg in copy_segments)
-    cmd_exec(("mkvmerge", "-A",
-              "--split", "parts-frames:" + ",".join(copy_segments),
-              "-o", f_out, f_in))
+def split_video(f_in, f_out, cutlist_frm: CutList):
+    mkvmerge_segments = to_mkvmerge_frame_segments(cutlist_frm, separator=",")
+    cmd_exec(
+        (
+            "mkvmerge",
+            "-A",
+            "--split",
+            "parts-frames:" + mkvmerge_segments,
+            "-o",
+            f_out,
+            f_in,
+        )
+    )
 
 
 def merge_parts(video_files, audio_file, f_out):
-    cmd_exec(("mkvmerge", "--engage", "no_cue_duration", "--engage",
-              "no_cue_relative_position",
-              "-o", f_out, video_files[0])
-             + tuple('+' + v for v in video_files[1:]) + (audio_file,),
-             ok_return_codes=(0, 1))
+    cmd_exec(
+        (
+            "mkvmerge",
+            "--engage",
+            "no_cue_duration",
+            "--engage",
+            "no_cue_relative_position",
+            "-o",
+            f_out,
+            video_files[0],
+        )
+        + tuple("+" + v for v in video_files[1:])
+        + (audio_file,),
+        ok_return_codes=(0, 1),
+    )
 
 
 def load_cutlist(stream):
@@ -316,46 +360,74 @@ def load_cutlist(stream):
         r"DurationFrames ?= ?(.*)$": Tgt("duration", int),
         r"Start ?= ?(.*)$": Tgt("t_start", float),
         r"Duration ?= ?(.*)$": Tgt("t_duration", float),
-        r"ApplyToFile ?= ?(.*)$": Tgt("in_file")
+        r"ApplyToFile ?= ?(.*)$": Tgt("in_file"),
     }
     out = parse(stream, mapping)
 
-    cutlist_duration = tuple(zip(listify(out.pop("start", [])),
-                                 listify(out.pop("duration", []))))
-    t_cutlist_duration = tuple(zip(listify(out.pop("t_start", [])),
-                                   listify(out.pop("t_duration", []))))
-    out["cutlist_frames"] = tuple((start, start + duration)
-                                  for start, duration in cutlist_duration)
-    out["cutlist_time"] = tuple((t_start, t_start + t_duration)
-                                for t_start, t_duration in t_cutlist_duration)
+    cutlist_duration = tuple(
+        zip(listify(out.pop("start", [])), listify(out.pop("duration", [])))
+    )
+    out["cutlist_frames"] = tuple(
+        (start, start + duration) for start, duration in cutlist_duration
+    )
     return out
 
 
 def load_cutlist_avidemux(stream):
+    """Avidemux seems to start at t>0 (depending on reference frames it has to load). Example: 5.2 sec <-> 13 frames @ 25 fps"""
+    fps = 25
     mapping = {
-        r"adm.addSegment\(0, ([0-9]*), ([0-9]*)\);?":
-        (Tgt("start", lambda s: int(s) // 40000 - 6),
-         Tgt("duration", lambda s: int(s) // 40000)),
-        r'adm.loadVideo\("([^"]*)"\);?': Tgt("in_file")
+        r"adm.addSegment\(0, ([0-9]*), ([0-9]*)\);?": (
+            Tgt("start", lambda s: int(int(s) * fps // 1000000)),
+            Tgt("duration", lambda s: int(int(s) * fps // 1000000)),
+        ),
+        r'(?:if not )?adm.loadVideo\("([^"]*)"\);?:?': Tgt("in_file"),
     }
     out = parse(stream, mapping)
-    out["cutlist_frames"] = tuple((max(0, start), (start + duration))
-                                  for start, duration in
-                                  zip(listify(out.pop("start", [])),
-                                      listify(out.pop("duration", []))))
+    out["cutlist_frames"] = tuple(
+        (max(0, start), (start + duration))
+        for start, duration in zip(
+            listify(out.pop("start", [])), listify(out.pop("duration", []))
+        )
+    )
     return out
 
 
-def cutlist_time_from_frames(cutlist_frm, fps):
-    return tuple((start / fps, stop / fps)
-                 for start, stop in cutlist_frm)
+def cutlist_time_from_frames(cutlist_frm: CutList, fps):
+    return tuple(
+        (to_timestamp(start, fps), to_timestamp(stop, fps))
+        for start, stop in cutlist_frm
+    )
+
+
+def to_mkvmerge_time_segments(
+    cutlist_frm: CutList, fps: float = 25, separator: str = ",+"
+) -> str:
+    return separator.join(
+        f"{to_timestamp(start, fps)}-{to_timestamp(end, fps)}"
+        for start, end in cutlist_frm
+    )
+
+
+def to_mkvmerge_frame_segments(cutlist_frm: CutList, separator: str = ",+") -> str:
+    return separator.join(
+        (str(start + 1) + "-" + str(stop + 1)) for start, stop in cutlist_frm
+    )
+
+
+def to_timestamp(frm: int, fps: float = 25) -> str:
+    sec = int(frm // fps)
+    ms = int(frm * 1000 / fps) - 1000 * sec
+    mins, sec = divmod(sec, 60)
+    hours, mins = divmod(mins, 60)
+    return f"{hours:02}:{mins:02}:{sec:02}.{ms:03}"
 
 
 cutlist_type_catalogue = {
     "//AD  <- Needed to identify //": load_cutlist_avidemux,
     "#PY  <- Needed to identify #": load_cutlist_avidemux,
     "[General]": load_cutlist,
-    None: load_cutlist
+    None: load_cutlist,
 }
 
 
@@ -366,7 +438,7 @@ def determine_cut_list_type(stream):
 
 def tuplify(key):
     if not isinstance(key, tuple):
-        return (key, )
+        return (key,)
     return key
 
 
@@ -376,41 +448,76 @@ def listify(key):
     return key
 
 
-def _main(cutlist_file_name, video_file_name, out_file_name, **kwargs):
-    with open(cutlist_file_name, 'r') as stream:
+def main(cutlist_path, video_path, out_path, cut_method, offset: int = 0, **kwargs):
+    with open(cutlist_path, "r", encoding="utf-8") as stream:
         loader = determine_cut_list_type(stream)
         cutlist_info = loader(stream)
-    f_in = video_file_name or cutlist_info.get("in_file")
+    f_in = video_path or cutlist_info.get("in_file")
     if f_in is None:
         raise ValueError("Input video file not specified!")
-    f_out = out_file_name or cutlist_info.get("out_file") \
-        or cutlist_file_name.rsplit(".", 1)[0] + ".mkv"
+    f_out = (
+        out_path
+        or cutlist_info.get("out_file")
+        or cutlist_path.rsplit(".", 1)[0] + ".mkv"
+    )
     if os.path.isfile(f_out) and os.path.samefile(f_in, f_out):
         f_out = f_out.rsplit(".", 1)[0] + ".cut.mkv"
+    cutlist_frm = [
+        (max(0, start + offset), end + offset)
+        for start, end in cutlist_info["cutlist_frames"]
+    ]
+    cut_method(f_in, f_out, cutlist_frm, **kwargs)
 
-    cut_file_by_cutlist(f_in,
-                        f_out,
-                        cutlist_info["cutlist_frames"],
-                        cutlist_t=cutlist_info.get("cutlist_time", None),
-                        **kwargs)
+
+def cleanup(files):
+    for f in files:
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="smartcut")
-    parser.add_argument("-o", dest="out", default=None,
-                        help="Output file (default: <input file>.cut )")
-    parser.add_argument("--profile", default="HQ",
-                        help="x264 profile HQ|HD (default: HQ)")
-    parser.add_argument("--workingdir", default=None,
-                        help="Working directory (default: temporary)")
+    parser.add_argument(
+        "-o", dest="out", default=None, help="Output file (default: <input file>.cut )"
+    )
+    parser.add_argument(
+        "--workingdir", default=None, help="Working directory (default: temporary)"
+    )
     parser.add_argument("cutlist", help="Cutlist")
     parser.add_argument(
-        "-i", default=None, help="Input video file (must only be given if"
-        " not specified in the cutlist file)")
+        "-i",
+        default=None,
+        help="Input video file (must only be given if"
+        " not specified in the cutlist file)",
+    )
+    parser.add_argument("--offset", default=0, help="frame offset", type=int)
+    modes = {
+        "smart": smart_cut_file_by_cutlist,
+        "smart:HQ": smart_cut_file_by_cutlist,
+        "smart:HD": smart_cut_file_by_cutlist_hd,
+    }
+    parser.add_argument(
+        "--mode",
+        default=smart_cut_file_by_cutlist,
+        type=modes.__getitem__,
+        help=f"Cut mode ({' / '.join(modes)})",
+    )
 
     cmd_args = parser.parse_args()
 
-    _main(cmd_args.cutlist, cmd_args.i, cmd_args.out,
-          workingdir=cmd_args.workingdir,
-          x264_profile=cmd_args.profile)
+    try:
+        main(
+            cmd_args.cutlist,
+            cmd_args.i,
+            cmd_args.out,
+            offset=cmd_args.offset,
+            workingdir=cmd_args.workingdir,
+            cut_method=cmd_args.mode,
+        )
+    except subprocess.CalledProcessError as _e:
+        sys.stderr.write(_e.stderr + "\n")
+        sys.exit(1)
