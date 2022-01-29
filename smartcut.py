@@ -545,6 +545,7 @@ def to_sec_ms(frm: int, fps: float) -> tuple[int, int]:
 cutlist_type_catalogue = {
     "//AD  <- Needed to identify //": load_cutlist_avidemux,
     "#PY  <- Needed to identify #": load_cutlist_avidemux,
+    "# PY  <- Needed to identify #": load_cutlist_avidemux,
     "[General]": load_cutlist,
     None: load_cutlist,
 }
