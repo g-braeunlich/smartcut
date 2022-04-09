@@ -354,6 +354,9 @@ def get_fps(filename: str) -> float:
     except (FileNotFoundError, RuntimeError):
         sys.stderr.write("⚠ Could not determine fps, defaulting to 25\n")
         return 25.0
+    if b"\n" in fps_str:
+        fps_str, _ = fps_str.split(b"\n", 1)
+        fps_str = fps_str.strip(b'"')
     if b"/" in fps_str:
         a, b = fps_str.split(b"/")
         return float(a) / float(b)
@@ -648,5 +651,5 @@ if __name__ == "__main__":
             segmented=cmd_args.segmented,
         )
     except subprocess.CalledProcessError as _e:
-        sys.stderr.write(_e.stderr + "\n")
+        sys.stderr.write(_e.stderr.decode() + "\n")
         sys.exit(1)
