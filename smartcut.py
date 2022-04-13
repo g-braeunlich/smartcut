@@ -17,7 +17,7 @@ import tempfile
 import contextlib
 from itertools import count
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Callable
 from typing import Optional
 
 CutList = Sequence[tuple[int, int]]
@@ -65,6 +65,7 @@ def cut_file_by_cutlist_reencode(
     cutlist_frm: CutList,
     workingdir: Optional[str] = None,
     segmented: bool = False,
+    ffmpeg_opts: Sequence[str] = (),
 ):
     """Cut a video file, reencoding everything with ffmpeg."""
 
@@ -92,6 +93,7 @@ def cut_file_by_cutlist_reencode(
                 to_seconds(start, fps),
                 "-to",
                 to_seconds(end, fps),
+                *ffmpeg_opts,
                 segment,
             )
             for segment, (start, end) in zip(segments, cutlist_frm)
@@ -110,6 +112,34 @@ def cut_file_by_cutlist_reencode(
     cmd_exec(cmd)
     for segment in segments:
         os.unlink(segment)
+
+
+def cut_file_by_cutlist_reencode_h265(
+    preset: Optional[str] = None,
+) -> Callable[[str, str, CutList, Optional[str], bool], None]:
+    def _cut_file_by_cutlist_reencode_h265(
+        f_in,
+        f_out,
+        cutlist_frm: CutList,
+        workingdir: Optional[str] = None,
+        segmented: bool = False,
+    ) -> None:
+        if preset is None:
+            preset_opts: tuple[str, ...] = ()
+        else:
+            preset_opts = ("-preset", preset)
+        cut_file_by_cutlist_reencode(
+            f_in,
+            f_out,
+            cutlist_frm,
+            workingdir,
+            segmented,
+            ffmpeg_opts=("-c:v", "libx265")
+            + preset_opts
+            + ("-threads", "0", "-max_muxing_queue_size", "1024"),
+        )
+
+    return _cut_file_by_cutlist_reencode_h265
 
 
 def cut_file_by_cutlist(
@@ -624,6 +654,22 @@ if __name__ == "__main__":
         "smart:HD": smart_cut_file_by_cutlist_hd,
         "lossless": cut_file_by_cutlist,
         "reencode": cut_file_by_cutlist_reencode,
+        "reencode:h265": cut_file_by_cutlist_reencode_h265(),
+        **{
+            "reencode:h265:" + preset: cut_file_by_cutlist_reencode_h265(preset)
+            for preset in (
+                "ultrafast",
+                "superfast",
+                "veryfast",
+                "faster",
+                "fast",
+                "medium",
+                "slow",
+                "slower",
+                "veryslow",
+                "placebo",
+            )
+        },
     }
     parser.add_argument(
         "--mode",
